@@ -1,0 +1,19 @@
+.DS_Store
+AGENTS.md
+DerivedData/
+.build/
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# Swift Package Manager
+.swiftpm/
+
+# Local archives and build products
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
