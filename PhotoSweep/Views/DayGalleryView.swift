@@ -194,6 +194,7 @@ struct DayGalleryView: View {
             selectedIdentifiers.remove(identifier)
         } else {
             selectedIdentifiers.insert(identifier)
+            PhotoLibraryService.shared.prepareDeletionSize(for: asset)
         }
     }
 

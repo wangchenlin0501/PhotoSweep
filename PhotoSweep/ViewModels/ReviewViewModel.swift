@@ -207,6 +207,7 @@ final class ReviewViewModel: ObservableObject {
         let wasLastVisibleAsset = currentIndex == batch.count - 1
 
         if !pendingDeletionIdentifiers.contains(currentAsset.localIdentifier) {
+            photoLibrary.prepareDeletionSize(for: currentAsset)
             pendingDeletionIdentifiers.append(currentAsset.localIdentifier)
             pendingDeletionAssets.append(currentAsset)
             deletionReviewAssets.append(currentAsset)
@@ -256,6 +257,7 @@ final class ReviewViewModel: ObservableObject {
         } else {
             pendingDeletionIdentifiers.append(identifier)
             pendingDeletionAssets.append(asset)
+            photoLibrary.prepareDeletionSize(for: asset)
         }
     }
 

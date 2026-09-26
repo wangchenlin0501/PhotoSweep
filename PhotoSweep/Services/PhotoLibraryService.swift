@@ -283,8 +283,14 @@ final class PhotoLibraryService {
         }
     }
 
-    /// Calculates the size before deletion, because a successful PhotoKit change
-    /// makes the original assets unavailable to this app.
+    @MainActor
+    func prepareDeletionSize(for asset: PHAsset) {
+        DeletionSizeReader.shared.prepare(asset)
+    }
+
+    /// Measure before PhotoKit removes access to the original resources.
+    /// iCloud originals may need to download; previews are not original sizes.
+    @MainActor
     func deletionMetrics(for identifiers: [String]) async -> DeletionMetrics {
         let selectedAssets = assets(for: identifiers)
         var metrics: [AssetDeletionMetric] = []
@@ -300,47 +306,84 @@ final class PhotoLibraryService {
                 category = .photo
             }
 
-            let byteCount = await resourceByteCount(for: asset)
+            let byteCount = await DeletionSizeReader.shared.byteCount(for: asset)
             metrics.append(AssetDeletionMetric(category: category, byteCount: byteCount))
         }
 
         return DeletionMetrics(assets: metrics)
     }
 
-    private func resourceByteCount(for asset: PHAsset) async -> Int64? {
+}
+
+@MainActor
+private final class DeletionSizeReader {
+    static let shared = DeletionSizeReader()
+    private var cached: [String: Int64] = [:]
+    private var requests: [String: Task<Int64?, Never>] = [:]
+
+    func prepare(_ asset: PHAsset) {
+        // Speculative downloads are bounded even when users swipe quickly.
+        Task {
+            guard requests.count < 3 else { return }
+            _ = await byteCount(for: asset)
+        }
+    }
+
+    func byteCount(for asset: PHAsset) async -> Int64? {
+        let key = asset.localIdentifier + ":" + String(asset.modificationDate?.timeIntervalSince1970 ?? 0)
+        if let value = cached[key] { return value }
+        if let request = requests[key] { return await request.value }
         let resources = PHAssetResource.assetResources(for: asset).filter {
             $0.type != .adjustmentData
         }
-        guard !resources.isEmpty else { return nil }
-
-        var total: Int64 = 0
-        for resource in resources {
-            if let streamedSize = await streamedByteCount(for: resource) {
-                total += streamedSize
-            } else {
-                return nil
+        let request = Task<Int64?, Never> {
+            guard !resources.isEmpty else { return nil }
+            var total: Int64 = 0
+            for resource in resources {
+                guard let count = await Self.readSize(resource) else { return nil }
+                total += count
             }
+            return total > 0 ? total : nil
         }
-        return total
+        requests[key] = request
+        let result = await request.value
+        requests[key] = nil
+        if let result {
+            if cached.count >= 128 { cached.removeAll(keepingCapacity: true) }
+            cached[key] = result
+        }
+        return result
     }
 
-    /// Public-API fallback for iOS versions where PhotoKit does not expose a
-    /// resource size. Data arrives in chunks and is never retained in memory.
-    private func streamedByteCount(for resource: PHAssetResource) async -> Int64? {
+    private static func readSize(_ resource: PHAssetResource) async -> Int64? {
         await withCheckedContinuation { continuation in
             let options = PHAssetResourceRequestOptions()
             options.isNetworkAccessAllowed = true
-            var byteCount: Int64 = 0
-
-            PHAssetResourceManager.default().requestData(
-                for: resource,
-                options: options
-            ) { data in
-                byteCount += Int64(data.count)
+            let counter = ResourceByteCounter()
+            PHAssetResourceManager.default().requestData(for: resource, options: options) { data in
+                counter.append(data.count)
             } completionHandler: { error in
-                continuation.resume(returning: error == nil ? byteCount : nil)
+                continuation.resume(returning: error == nil ? counter.total : nil)
             }
         }
+    }
+}
+
+/// PhotoKit delivers chunks on background queues. Retain only a byte count.
+private final class ResourceByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes: Int64 = 0
+
+    func append(_ count: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        bytes += Int64(count)
+    }
+
+    var total: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return bytes
     }
 }
 
