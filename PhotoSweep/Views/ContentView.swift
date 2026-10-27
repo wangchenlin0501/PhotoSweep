@@ -7,6 +7,7 @@ struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var viewModel = ReviewViewModel()
     @State private var deletionGlowProgress = 0.0
     @State private var isPreparingShare = false
@@ -164,11 +165,13 @@ struct ContentView: View {
         VStack(spacing: 14) {
             HStack(spacing: 10) {
                 Text("\(viewModel.reviewedCount) / \(viewModel.originalBatchCount)")
-                    .font(.headline.monospacedDigit())
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
                 ProgressView(
                     value: Double(viewModel.reviewedCount),
                     total: Double(max(viewModel.originalBatchCount, 1))
                 )
+                .accessibilityLabel("本组已查看")
+                .accessibilityValue("\(viewModel.reviewedCount) / \(viewModel.originalBatchCount)")
                 if viewModel.authorizationStatus == .limited {
                     Button("有限访问") { openSettings() }
                         .font(.caption.weight(.semibold))
@@ -187,6 +190,15 @@ struct ContentView: View {
             )
             .id(asset.localIdentifier)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityActions {
+                if viewModel.canShowPrevious {
+                    Button("上一项") { viewModel.showPreviousAsset() }
+                }
+                Button(viewModel.canShowNext ? "下一项" : "完成本组") {
+                    if !viewModel.showNextAsset() { viewModel.finishBatch() }
+                }
+                Button("加入待删除", action: viewModel.markCurrentForDeletion)
+            }
 
             // Reserve a separate row so controls never cover the resting photo
             // or resize it when undo becomes available.
@@ -220,159 +232,46 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 48)
-            .animation(.spring(response: 0.3, dampingFraction: 0.78), value: viewModel.canUndoDeletion)
+            .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.78), value: viewModel.canUndoDeletion)
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 12)
     }
 
     private var completionView: some View {
-        ZStack {
-            Color(uiColor: .systemBackground)
-                .ignoresSafeArea()
-            LinearGradient(
-                colors: [Color.accentColor.opacity(0.08), .clear],
-                startPoint: .top,
-                endPoint: .center
-            )
-            .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                VStack(spacing: 24) {
-                    VStack(spacing: 6) {
-                        Text("回顾完毕")
-                            .font(.system(size: 34, weight: .bold, design: .rounded))
-                            .foregroundStyle(.primary)
-                        Text(
-                            viewModel.deletionReviewAssets.isEmpty
-                                ? "这一组没有需要删除的项目"
-                                : "请选择最终需要删除的项目"
+        BatchCompletionView(
+            reviewedCount: viewModel.reviewedCount,
+            candidateCount: viewModel.deletionReviewAssets.count,
+            selectedCount: viewModel.pendingDeletionIdentifiers.count,
+            isLoading: viewModel.isLoading,
+            isDeleting: viewModel.isDeleting,
+            onNext: { Task { await viewModel.loadBatch() } },
+            onKeep: { Task { await viewModel.changePendingDeletionToKeep() } },
+            onDelete: { Task { await viewModel.commitPendingDeletion() } }
+        ) {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 88), spacing: 8)],
+                spacing: 8
+            ) {
+                ForEach(viewModel.deletionReviewAssets, id: \.localIdentifier) { asset in
+                    Button {
+                        viewModel.toggleDeletionSelection(for: asset)
+                    } label: {
+                        DeletionReviewThumbnail(
+                            asset: asset,
+                            isSelected: viewModel.isSelectedForDeletion(asset)
                         )
-                        .font(.headline)
-                        .foregroundStyle(.secondary)
                     }
-
-                    if viewModel.deletionReviewAssets.isEmpty {
-                        Spacer()
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 82, weight: .semibold))
-                            .foregroundStyle(.green)
-                        Text("已查看 \(viewModel.reviewedCount) 个项目")
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    } else {
-                        ScrollView {
-                            LazyVGrid(
-                                columns: Array(
-                                    repeating: GridItem(.flexible(), spacing: 10),
-                                    count: 3
-                                ),
-                                spacing: 10
-                            ) {
-                                ForEach(viewModel.deletionReviewAssets, id: \.localIdentifier) { asset in
-                                    Button {
-                                        viewModel.toggleDeletionSelection(for: asset)
-                                    } label: {
-                                        DeletionReviewThumbnail(
-                                            asset: asset,
-                                            isSelected: viewModel.isSelectedForDeletion(asset)
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel(
-                                        viewModel.isSelectedForDeletion(asset)
-                                            ? "取消选择此项目"
-                                            : "选择此项目删除"
-                                    )
-                                }
-                            }
-                        }
-                        .scrollIndicators(.hidden)
-                    }
-
-                    completionActions
-                }
-                .padding(.horizontal, 22)
-                .padding(.top, 38)
-                .padding(.bottom, 22)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(.regularMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 34, style: .continuous)
-                        .stroke(Color.primary.opacity(0.12), lineWidth: 1)
-                }
-                .shadow(color: .black.opacity(0.14), radius: 28, y: 14)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 18)
-            .padding(.bottom, 20)
-
-        }
-        .animation(
-            .spring(response: 0.3, dampingFraction: 0.78),
-            value: viewModel.pendingDeletionIdentifiers.count
-        )
-    }
-
-    @ViewBuilder
-    private var completionActions: some View {
-        if viewModel.deletionReviewAssets.isEmpty {
-            Button {
-                Task { await viewModel.loadBatch() }
-            } label: {
-                Text("再来一组")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 18)
-                    .background(.blue, in: Capsule())
-            }
-            .buttonStyle(.plain)
-        } else {
-            HStack(spacing: 12) {
-                Button {
-                    Task { await viewModel.changePendingDeletionToKeep() }
-                } label: {
-                    Text("放弃，再来一组")
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 18)
-                        .background(Color.secondary.opacity(0.12), in: Capsule())
-                        .overlay {
-                            Capsule().stroke(Color.secondary.opacity(0.24), lineWidth: 1)
-                        }
-                }
-                .buttonStyle(.plain)
-                .disabled(viewModel.isDeleting)
-
-                Button(role: .destructive) {
-                    Task { await viewModel.commitPendingDeletion() }
-                } label: {
-                    Group {
-                        if viewModel.isDeleting {
-                            ProgressView().tint(.white)
-                        } else {
-                            Text("确认删除（\(viewModel.pendingDeletionIdentifiers.count)）")
-                                .font(.headline)
-                        }
-                    }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 18)
-                    .background(
-                        Color.red.opacity(
-                            viewModel.pendingDeletionIdentifiers.isEmpty ? 0.28 : 0.82
-                        ),
-                        in: Capsule()
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(
+                        viewModel.isSelectedForDeletion(asset)
+                            ? "取消选择此项目"
+                            : "选择此项目删除"
+                    )
+                    .accessibilityAddTraits(
+                        viewModel.isSelectedForDeletion(asset) ? .isSelected : []
                     )
                 }
-                .buttonStyle(.plain)
-                .disabled(
-                    viewModel.isDeleting || viewModel.pendingDeletionIdentifiers.isEmpty
-                )
             }
         }
     }
@@ -521,6 +420,7 @@ private struct DeletionReviewThumbnail: View {
                         .scaledToFill()
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .clipped()
+                        .allowsHitTesting(false)
                 } else {
                     ProgressView()
                         .tint(.secondary)
@@ -569,6 +469,7 @@ private struct DeletionReviewThumbnail: View {
             .opacity(isSelected ? 1 : 0.58)
         }
         .aspectRatio(1, contentMode: .fit)
+        .contentShape(.interaction, Rectangle())
         .onAppear(perform: loadThumbnail)
         .onDisappear(perform: cancelRequest)
     }

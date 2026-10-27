@@ -133,7 +133,6 @@ private struct ZoomableImageView: UIViewRepresentable {
     func updateUIView(_ scrollView: UIScrollView, context: Context) {
         context.coordinator.onZoomStateChange = onZoomStateChange
         if context.coordinator.imageView?.image !== image {
-            scrollView.setZoomScale(1, animated: false)
             context.coordinator.imageView?.image = image
         }
     }

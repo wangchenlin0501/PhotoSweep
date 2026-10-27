@@ -53,17 +53,9 @@ struct DayGalleryView: View {
         }
         .fullScreenCover(item: $previewItem) { item in
             DayGalleryPreview(
-                asset: item.asset,
-                isSelected: Binding(
-                    get: { selectedIdentifiers.contains(item.asset.localIdentifier) },
-                    set: { isSelected in
-                        if isSelected {
-                            selectedIdentifiers.insert(item.asset.localIdentifier)
-                        } else {
-                            selectedIdentifiers.remove(item.asset.localIdentifier)
-                        }
-                    }
-                )
+                assets: assets,
+                initialIdentifier: item.id,
+                selectedIdentifiers: $selectedIdentifiers
             )
         }
         .task(id: Calendar.autoupdatingCurrent.startOfDay(for: date)) {
@@ -372,8 +364,19 @@ private struct DayGalleryPreviewItem: Identifiable {
 }
 
 private struct DayGalleryPreview: View {
-    let asset: PHAsset
-    @Binding var isSelected: Bool
+    let assets: [PHAsset]
+    @Binding var selectedIdentifiers: Set<String>
+    @State private var currentIndex: Int
+    @State private var isSwitching = false
+
+    init(assets: [PHAsset], initialIdentifier: String, selectedIdentifiers: Binding<Set<String>>) {
+        self.assets = assets
+        self._selectedIdentifiers = selectedIdentifiers
+        self._currentIndex = State(initialValue: assets.firstIndex { $0.localIdentifier == initialIdentifier } ?? 0)
+    }
+
+    private var asset: PHAsset { assets[currentIndex] }
+    private var isSelected: Bool { selectedIdentifiers.contains(asset.localIdentifier) }
     @Environment(\.dismiss) private var dismiss
     @State private var isMediaZoomed = false
     @State private var dragWasInterrupted = false
@@ -393,6 +396,7 @@ private struct DayGalleryPreview: View {
                             resetDrag()
                         }
                     }
+                    .id(asset.localIdentifier)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .scaleEffect(1 - min(hypot(dragOffset.width, dragOffset.height) / 1600, 0.12))
                     .offset(dragOffset)
@@ -402,13 +406,20 @@ private struct DayGalleryPreview: View {
             .onChange(of: isDragging) { _, isDragging in
                 if !isDragging {
                     dragWasInterrupted = false
-                    if !isDismissing { resetDrag() }
+                    if !isDismissing && !isSwitching { resetDrag() }
                 }
             }
             .navigationTitle(
                 asset.creationDate?.formatted(date: .abbreviated, time: .omitted) ?? "预览"
             )
             .navigationBarTitleDisplayMode(.inline)
+            .task(id: currentIndex) {
+                let start = max(0, currentIndex - 1)
+                let end = min(assets.count - 1, currentIndex + 2)
+                for index in start...end {
+                    MediaPreloadService.shared.loadImage(for: assets[index]) { _ in }
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button {
@@ -420,7 +431,12 @@ private struct DayGalleryPreview: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        isSelected.toggle()
+                        if isSelected {
+                            selectedIdentifiers.remove(asset.localIdentifier)
+                        } else {
+                            selectedIdentifiers.insert(asset.localIdentifier)
+                            PhotoLibraryService.shared.prepareDeletionSize(for: asset)
+                        }
                     } label: {
                         Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                             .foregroundStyle(isSelected ? .blue : .white)
@@ -456,8 +472,26 @@ private struct DayGalleryPreview: View {
                     value.predictedEndTranslation.width,
                     value.predictedEndTranslation.height
                 )
-                // Use distance rather than an axis: all swipe directions dismiss.
-                if distance >= 80 || (distance >= 24 && projectedDistance >= 160) {
+                let horizontal = abs(value.translation.width) > abs(value.translation.height)
+                if horizontal {
+                    let nextIndex = currentIndex + (value.translation.width < 0 ? 1 : -1)
+                    if (distance >= 60 || (distance >= 20 && projectedDistance >= 140)),
+                       assets.indices.contains(nextIndex) {
+                        isSwitching = true
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            dragOffset = CGSize(width: value.translation.width < 0 ? -mediaFrame.width : mediaFrame.width, height: 0)
+                        } completion: {
+                            var transaction = Transaction(animation: nil)
+                            transaction.disablesAnimations = true
+                            withTransaction(transaction) {
+                                currentIndex = nextIndex
+                                dragOffset = .zero
+                                isMediaZoomed = false
+                                isSwitching = false
+                            }
+                        }
+                    } else { resetDrag() }
+                } else if distance >= 80 || (distance >= 24 && projectedDistance >= 160) {
                     isDismissing = true
                     dismiss()
                 } else {
@@ -467,7 +501,7 @@ private struct DayGalleryPreview: View {
     }
 
     private func canDismiss(from start: CGPoint, in mediaFrame: CGRect) -> Bool {
-        guard !isMediaZoomed, !dragWasInterrupted, !isDismissing else { return false }
+        guard !isMediaZoomed, !dragWasInterrupted, !isDismissing, !isSwitching else { return false }
         // Leave the video's bottom transport/scrubbing region to the player.
         return asset.mediaType != .video || start.y < mediaFrame.maxY - 100
     }

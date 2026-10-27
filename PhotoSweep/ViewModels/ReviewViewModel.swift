@@ -44,6 +44,11 @@ final class ReviewViewModel: ObservableObject {
     private var deletionUndoStack: [DeletionUndoEntry] = []
     private var hasStarted = false
     private var cancellables: Set<AnyCancellable> = []
+    private var nextBatch: [PHAsset] = []
+    // Keep the original group reserved, including undoable deletion candidates.
+    private var currentPreloadAssets: [PHAsset] = []
+    private var nextBatchTask: Task<Void, Never>?
+    private var preloadGeneration = 0
 
     init(
         photoLibrary: PhotoLibraryService = .shared,
@@ -116,7 +121,13 @@ final class ReviewViewModel: ObservableObject {
     }
 
     func refreshAuthorization() {
+        let previousStatus = authorizationStatus
         authorizationStatus = photoLibrary.authorizationStatus
+        if previousStatus != authorizationStatus || authorizationStatus == .limited {
+            invalidateNextBatch()
+            updatePreloadWindow()
+            if hasReadAccess { prepareNextBatchIfNeeded() }
+        }
         if hasReadAccess, batch.isEmpty, !isLoading {
             Task { await loadBatch() }
         }
@@ -130,13 +141,18 @@ final class ReviewViewModel: ObservableObject {
     }
 
     func loadBatch() async {
-        guard hasReadAccess, let modelContext else { return }
+        guard hasReadAccess, !isLoading, let modelContext else { return }
 
         isLoading = true
         errorMessage = nil
         defer { isLoading = false }
 
         do {
+            // A fast finish may reach this point while the replacement group is
+            // still being selected. Reuse that selection instead of racing it.
+            await nextBatchTask?.value
+            authorizationStatus = photoLibrary.authorizationStatus
+            guard hasReadAccess, !Task.isCancelled else { return }
             let records = try modelContext.fetch(FetchDescriptor<ReviewRecord>())
             recordsByIdentifier = Dictionary(
                 uniqueKeysWithValues: records.map { ($0.assetIdentifier, $0) }
@@ -144,24 +160,45 @@ final class ReviewViewModel: ObservableObject {
             reviewedHistoryCount = records.count
             let cooldowns = recordsByIdentifier.mapValues(\.eligibleAgainAt)
             let offlineIdentifiers = offlineCache.cachedIdentifiers
-            let sample: PhotoSample
-            if offlineIdentifiers.isEmpty {
-                sample = await photoLibrary.randomEligibleSample(
-                    cooldowns: cooldowns,
-                    limit: Self.batchSize
-                )
+            let allowedOfflineIdentifiers = Set(offlineIdentifiers)
+            let now = Date()
+            let preparedIdentifiers = nextBatch.map(\.localIdentifier).filter {
+                (cooldowns[$0] ?? .distantPast) <= now
+                    && (offlineIdentifiers.isEmpty || allowedOfflineIdentifiers.contains($0))
+            }
+            let preparedAssets = photoLibrary.assets(for: preparedIdentifiers)
+            invalidateNextBatch()
+            let generation = preloadGeneration
+
+            if !preparedAssets.isEmpty {
+                batch = preparedAssets
             } else {
-                sample = await photoLibrary.randomEligibleSample(
-                    from: offlineIdentifiers,
-                    cooldowns: cooldowns,
-                    limit: Self.batchSize
-                )
+                let sample: PhotoSample
+                if offlineIdentifiers.isEmpty {
+                    sample = await photoLibrary.randomEligibleSample(
+                        cooldowns: cooldowns,
+                        limit: Self.batchSize * 2
+                    )
+                } else {
+                    sample = await photoLibrary.randomEligibleSample(
+                        from: offlineIdentifiers,
+                        cooldowns: cooldowns,
+                        limit: Self.batchSize * 2
+                    )
+                }
+                // Permission or package changes can happen during the fetch.
+                guard !Task.isCancelled,
+                      generation == preloadGeneration,
+                      photoLibrary.authorizationStatus == authorizationStatus,
+                      offlineCache.cachedIdentifiers == offlineIdentifiers else { return }
+                let assets = photoLibrary.assets(for: sample.identifiers)
+                batch = Array(assets.prefix(Self.batchSize))
+                nextBatch = Array(assets.dropFirst(Self.batchSize))
+                accessibleCount = sample.accessibleCount
+                eligibleCount = sample.eligibleCount
+                nextEligibleDate = sample.nextEligibleDate
             }
 
-            batch = photoLibrary.assets(for: sample.identifiers)
-            accessibleCount = sample.accessibleCount
-            eligibleCount = sample.eligibleCount
-            nextEligibleDate = sample.nextEligibleDate
             currentIndex = 0
             pendingDeletionIdentifiers = []
             pendingDeletionAssets = []
@@ -170,9 +207,12 @@ final class ReviewViewModel: ObservableObject {
             originalBatchCount = batch.count
             visitedIdentifiers = []
             hasFinishedBatch = false
+            currentPreloadAssets = batch
             refreshOfflineAvailableCount()
-            MediaPreloadService.shared.prepareBatch(batch)
+            updatePreloadWindow()
+            batch.forEach { photoLibrary.prepareDeletionSize(for: $0) }
             recordCurrentViewIfNeeded()
+            prepareNextBatchIfNeeded()
         } catch {
             errorMessage = "无法读取浏览记录：\(error.localizedDescription)"
         }
@@ -278,6 +318,7 @@ final class ReviewViewModel: ObservableObject {
         }
 
         offlineCache.removeCachedItems(with: identifiers)
+        removeFromPreloadWindow(identifiers)
         do {
             apply(deletionMetrics)
             for identifier in identifiers {
@@ -318,6 +359,7 @@ final class ReviewViewModel: ObservableObject {
         }
 
         offlineCache.removeCachedItems(with: identifiers)
+        removeFromPreloadWindow(identifiers)
 
         do {
             apply(deletionMetrics)
@@ -408,6 +450,9 @@ final class ReviewViewModel: ObservableObject {
             )
             let assets = photoLibrary.assets(for: sample.identifiers)
             try await offlineCache.prepare(assets: assets)
+            invalidateNextBatch()
+            updatePreloadWindow()
+            prepareNextBatchIfNeeded()
             refreshOfflineAvailableCount()
         } catch {
             errorMessage = "提前加载没有完成。\n" + error.localizedDescription
@@ -426,6 +471,9 @@ final class ReviewViewModel: ObservableObject {
             recordsByIdentifier = [:]
             reviewedHistoryCount = 0
             nextEligibleDate = nil
+            invalidateNextBatch()
+            updatePreloadWindow()
+            prepareNextBatchIfNeeded()
             refreshOfflineAvailableCount()
 
             if batch.isEmpty, hasReadAccess {
@@ -438,7 +486,11 @@ final class ReviewViewModel: ObservableObject {
     }
 
     func clearOfflinePackage() async {
+        guard !offlineCacheStatus.isPreparing else { return }
         offlineCache.clear()
+        invalidateNextBatch()
+        updatePreloadWindow()
+        prepareNextBatchIfNeeded()
         offlineAvailableCount = 0
         if batch.isEmpty, hasReadAccess {
             await loadBatch()
@@ -447,6 +499,62 @@ final class ReviewViewModel: ObservableObject {
 
     func dismissError() {
         errorMessage = nil
+    }
+
+    private func invalidateNextBatch() {
+        preloadGeneration &+= 1
+        nextBatchTask?.cancel()
+        nextBatchTask = nil
+        nextBatch = []
+    }
+
+    private func updatePreloadWindow() {
+        MediaPreloadService.shared.prepareBatches(
+            current: hasReadAccess ? currentPreloadAssets : [],
+            next: hasReadAccess ? nextBatch : []
+        )
+    }
+
+    private func removeFromPreloadWindow(_ identifiers: [String]) {
+        let removed = Set(identifiers)
+        preloadGeneration &+= 1
+        nextBatchTask?.cancel()
+        nextBatchTask = nil
+        nextBatch.removeAll { removed.contains($0.localIdentifier) }
+        currentPreloadAssets.removeAll { removed.contains($0.localIdentifier) }
+        updatePreloadWindow()
+        prepareNextBatchIfNeeded()
+    }
+
+    private func prepareNextBatchIfNeeded() {
+        guard hasReadAccess, !currentPreloadAssets.isEmpty,
+              nextBatch.isEmpty, nextBatchTask == nil else { return }
+        let generation = preloadGeneration
+        let cooldowns = recordsByIdentifier.mapValues(\.eligibleAgainAt)
+        let excluded = Set(currentPreloadAssets.map(\.localIdentifier))
+        let offlineIdentifiers = offlineCache.cachedIdentifiers
+        let status = authorizationStatus
+        nextBatchTask = Task { [weak self, photoLibrary] in
+            let sample: PhotoSample
+            if offlineIdentifiers.isEmpty {
+                sample = await photoLibrary.randomEligibleSample(
+                    cooldowns: cooldowns, limit: Self.batchSize, excluding: excluded
+                )
+            } else {
+                sample = await photoLibrary.randomEligibleSample(
+                    from: offlineIdentifiers, cooldowns: cooldowns,
+                    limit: Self.batchSize, excluding: excluded
+                )
+            }
+            guard let self, generation == self.preloadGeneration else { return }
+            self.nextBatchTask = nil
+            guard !Task.isCancelled,
+                  photoLibrary.authorizationStatus == status,
+                  self.offlineCache.cachedIdentifiers == offlineIdentifiers else { return }
+            self.nextBatch = photoLibrary.assets(for: sample.identifiers)
+            self.nextEligibleDate = sample.nextEligibleDate
+            self.updatePreloadWindow()
+        }
     }
 
     private func setCooldown(for identifier: String, from date: Date) {

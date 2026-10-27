@@ -162,6 +162,7 @@ final class PhotoLibraryService {
         from identifiers: [String],
         cooldowns: [String: Date],
         limit: Int,
+        excluding excludedIdentifiers: Set<String> = [],
         now: Date = Date()
     ) async -> PhotoSample {
         await withCheckedContinuation { continuation in
@@ -186,6 +187,8 @@ final class PhotoLibraryService {
                         continue
                     }
                     accessibleCount += 1
+
+                    guard !excludedIdentifiers.contains(identifier) else { continue }
 
                     if let eligibleAgainAt = cooldowns[identifier], eligibleAgainAt > now {
                         if nextEligibleDate == nil || eligibleAgainAt < nextEligibleDate! {
@@ -296,6 +299,9 @@ final class PhotoLibraryService {
         var metrics: [AssetDeletionMetric] = []
         metrics.reserveCapacity(selectedAssets.count)
 
+        // Start all selected measurements before awaiting them, reusing batch work.
+        selectedAssets.forEach { DeletionSizeReader.shared.prepare($0) }
+
         for asset in selectedAssets {
             let category: DeletedMediaCategory
             if asset.mediaType == .video {
@@ -318,47 +324,121 @@ final class PhotoLibraryService {
 @MainActor
 private final class DeletionSizeReader {
     static let shared = DeletionSizeReader()
-    private var cached: [String: Int64] = [:]
-    private var requests: [String: Task<Int64?, Never>] = [:]
+    private static let cacheKey = "PhotoSweep.originalResourceSizes.v1"
+    private var cached: [String: Int64]
+    private var queued: [(key: String, resources: [PHAssetResource], allowNetwork: Bool)] = []
+    private var active: Set<String> = []
+    private var waiters: [String: [CheckedContinuation<Int64?, Never>]] = [:]
+
+    private init() {
+        cached = (UserDefaults.standard.dictionary(forKey: Self.cacheKey) ?? [:])
+            .compactMapValues { ($0 as? NSNumber)?.int64Value }
+    }
 
     func prepare(_ asset: PHAsset) {
-        // Speculative downloads are bounded even when users swipe quickly.
-        Task {
-            guard requests.count < 3 else { return }
-            _ = await byteCount(for: asset)
+        let key = cacheIdentifier(asset)
+        guard cached[key] == nil else { return }
+        let resources = mediaResources(asset)
+        if let size = metadataSize(resources) {
+            save(size, for: key)
+            return
         }
+        enqueue(key: key, resources: resources)
     }
 
     func byteCount(for asset: PHAsset) async -> Int64? {
-        let key = asset.localIdentifier + ":" + String(asset.modificationDate?.timeIntervalSince1970 ?? 0)
+        let key = cacheIdentifier(asset)
         if let value = cached[key] { return value }
-        if let request = requests[key] { return await request.value }
-        let resources = PHAssetResource.assetResources(for: asset).filter {
-            $0.type != .adjustmentData
+        let resources = mediaResources(asset)
+        if let size = metadataSize(resources) {
+            save(size, for: key)
+            return size
         }
-        let request = Task<Int64?, Never> {
-            guard !resources.isEmpty else { return nil }
-            var total: Int64 = 0
-            for resource in resources {
-                guard let count = await Self.readSize(resource) else { return nil }
-                total += count
+        return await withCheckedContinuation { continuation in
+            waiters[key, default: []].append(continuation)
+            // Prioritize a confirmed deletion over unreviewed batch items.
+            if let index = queued.firstIndex(where: { $0.key == key }) {
+                queued.remove(at: index)
             }
-            return total > 0 ? total : nil
+            enqueue(key: key, resources: resources, priority: true)
         }
-        requests[key] = request
-        let result = await request.value
-        requests[key] = nil
-        if let result {
-            if cached.count >= 128 { cached.removeAll(keepingCapacity: true) }
-            cached[key] = result
-        }
-        return result
     }
 
-    private static func readSize(_ resource: PHAssetResource) async -> Int64? {
-        await withCheckedContinuation { continuation in
+    private func cacheIdentifier(_ asset: PHAsset) -> String {
+        asset.localIdentifier + ":" + String(asset.modificationDate?.timeIntervalSince1970 ?? 0)
+    }
+
+    private func mediaResources(_ asset: PHAsset) -> [PHAssetResource] {
+        PHAssetResource.assetResources(for: asset).filter {
+            $0.type != .adjustmentData
+        }
+    }
+
+    private func metadataSize(_ resources: [PHAssetResource]) -> Int64? {
+        guard !resources.isEmpty else { return nil }
+        if #available(iOS 27.0, *) {
+            var total: Int64 = 0
+            for resource in resources {
+                guard let size = resource.dataSize, size > 0 else { return nil }
+                total += Int64(size)
+            }
+            return total
+        }
+        return nil
+    }
+
+    private func enqueue(key: String, resources: [PHAssetResource], priority: Bool = false) {
+        guard !active.contains(key), !queued.contains(where: { $0.key == key }) else { return }
+        if priority {
+            queued.insert((key, resources, true), at: 0)
+        } else {
+            // Background capacity checks must not compete with iCloud previews.
+            queued.append((key, resources, false))
+        }
+        drainQueue()
+    }
+
+    private func drainQueue() {
+        while active.count < 3, !queued.isEmpty {
+            let job = queued.removeFirst()
+            active.insert(job.key)
+            Task {
+                var total: Int64 = 0
+                var complete = !job.resources.isEmpty
+                for resource in job.resources {
+                    guard let size = await Self.readSize(resource, allowNetwork: job.allowNetwork) else {
+                        complete = false
+                        break
+                    }
+                    total += size
+                }
+                let result: Int64? = complete && total > 0 ? total : nil
+                if let result { save(result, for: job.key) }
+                active.remove(job.key)
+                if result == nil, !job.allowNetwork, waiters[job.key]?.isEmpty == false {
+                    enqueue(key: job.key, resources: job.resources, priority: true)
+                    return
+                }
+                let continuations = waiters.removeValue(forKey: job.key) ?? []
+                continuations.forEach { $0.resume(returning: result) }
+                drainQueue()
+            }
+        }
+    }
+
+    private func save(_ size: Int64, for key: String) {
+        if cached.count >= 2_000 { cached.removeAll(keepingCapacity: true) }
+        cached[key] = size
+        UserDefaults.standard.set(cached, forKey: Self.cacheKey)
+    }
+
+    private static func readSize(_ resource: PHAssetResource, allowNetwork: Bool) async -> Int64? {
+        if #available(iOS 27.0, *), let size = resource.dataSize, size > 0 {
+            return Int64(size)
+        }
+        return await withCheckedContinuation { continuation in
             let options = PHAssetResourceRequestOptions()
-            options.isNetworkAccessAllowed = true
+            options.isNetworkAccessAllowed = allowNetwork
             let counter = ResourceByteCounter()
             PHAssetResourceManager.default().requestData(for: resource, options: options) { data in
                 counter.append(data.count)

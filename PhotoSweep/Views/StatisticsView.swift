@@ -8,6 +8,7 @@ struct StatisticsView: View {
     @State private var isShowingResetConfirmation = false
     @State private var isShowingClearOfflineConfirmation = false
     @State private var selectedTrendDay: String?
+    @State private var offlinePackageLimit = 600
 
     private var statistics: StatisticsSnapshot {
         viewModel.statistics
@@ -547,13 +548,26 @@ struct StatisticsView: View {
                 .monospacedDigit()
             }
 
-            Button {
-                Task { await viewModel.prepareOfflinePackage() }
+            Menu {
+                ForEach([300, 600, 1_000], id: \.self) { limit in
+                    Button {
+                        offlinePackageLimit = limit
+                        Task { await viewModel.prepareOfflinePackage(limit: limit) }
+                    } label: {
+                        if limit == offlinePackageLimit {
+                            Label("准备 \(limit) 个项目", systemImage: "checkmark")
+                        } else {
+                            Text("准备 \(limit) 个项目")
+                        }
+                    }
+                }
             } label: {
                 Label(
                     status.isPreparing
                         ? "正在提前加载"
-                        : (status.cachedCount > 0 ? "重新准备 300 个项目" : "提前准备 300 个项目"),
+                        : (status.cachedCount > 0
+                            ? "重新准备更多项目"
+                            : "提前准备 \(offlinePackageLimit) 个项目"),
                     systemImage: status.isPreparing ? "arrow.down" : "arrow.down.circle.fill"
                 )
                 .font(.headline)
@@ -649,7 +663,7 @@ struct StatisticsView: View {
         if status.cachedCount > 0 {
             return "\(viewModel.offlineAvailableCount) / \(status.cachedCount)"
         }
-        return "0 / 300"
+        return "0 / \(offlinePackageLimit)"
     }
 
     private func offlineProgressColor(_ status: OfflineCacheSnapshot) -> Color {

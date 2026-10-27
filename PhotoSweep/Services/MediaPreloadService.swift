@@ -2,8 +2,7 @@ import AVFoundation
 import Photos
 import UIKit
 
-/// Preloads the currently selected batch, including iCloud-backed media, and
-/// keeps display-ready results in memory until the next batch begins.
+/// Maintains a rolling current/next batch window, including iCloud-backed media.
 @MainActor
 final class MediaPreloadService {
     static let shared = MediaPreloadService()
@@ -11,13 +10,17 @@ final class MediaPreloadService {
     private static let displayTargetSize = CGSize(width: 1600, height: 2000)
 
     private let manager = PHCachingImageManager()
-    private var cachedImages: [String: UIImage] = [:]
+    private let cachedImages = NSCache<NSString, UIImage>()
     private var cachedLivePhotos: [String: PHLivePhoto] = [:]
     private var cachedVideoAssets: [String: AVAsset] = [:]
 
-    private var imageRequests: [String: PHImageRequestID] = [:]
-    private var livePhotoRequests: [String: PHImageRequestID] = [:]
-    private var videoRequests: [String: PHImageRequestID] = [:]
+    private struct Request {
+        let id: PHImageRequestID
+        let token: UUID
+    }
+    private var imageRequests: [String: Request] = [:]
+    private var livePhotoRequests: [String: Request] = [:]
+    private var videoRequests: [String: Request] = [:]
 
     private var imageCompletions: [String: [(UIImage?) -> Void]] = [:]
     private var livePhotoCompletions: [String: [(PHLivePhoto?) -> Void]] = [:]
@@ -25,48 +28,69 @@ final class MediaPreloadService {
 
     private var activeAssets: [PHAsset] = []
     private var activeIdentifiers: Set<String> = []
-    private var batchGeneration = 0
+    private init() {
+        cachedImages.countLimit = 40
+        cachedImages.totalCostLimit = 144 * 1024 * 1024
+    }
 
-    private init() {}
+    func prepareBatches(current: [PHAsset], next: [PHAsset]) {
+        var seen: Set<String> = []
+        let assets = (current + next).filter { seen.insert($0.localIdentifier).inserted }
+        let identifiers = Set(assets.map(\.localIdentifier))
+        let added = assets.filter { !activeIdentifiers.contains($0.localIdentifier) }
+        let removed = activeAssets.filter { !identifiers.contains($0.localIdentifier) }
 
-    func prepareBatch(_ assets: [PHAsset]) {
-        batchGeneration &+= 1
-        stopCurrentBatch()
-
+        if !removed.isEmpty {
+            manager.stopCachingImages(
+                for: removed,
+                targetSize: Self.displayTargetSize,
+                contentMode: .aspectFit,
+                options: imageOptions()
+            )
+        }
         activeAssets = assets
-        activeIdentifiers = Set(assets.map(\.localIdentifier))
-        guard !assets.isEmpty else { return }
+        activeIdentifiers = identifiers
+        discardRequestsOutsideWindow()
+        for asset in removed {
+            cachedImages.removeObject(forKey: asset.localIdentifier as NSString)
+        }
+        cachedLivePhotos = cachedLivePhotos.filter { identifiers.contains($0.key) }
+        cachedVideoAssets = cachedVideoAssets.filter { identifiers.contains($0.key) }
 
-        manager.startCachingImages(
-            for: assets,
-            targetSize: Self.displayTargetSize,
-            contentMode: .aspectFit,
-            options: imageOptions()
-        )
+        if !added.isEmpty {
+            manager.startCachingImages(
+                for: added,
+                targetSize: Self.displayTargetSize,
+                contentMode: .aspectFit,
+                options: imageOptions()
+            )
+        }
 
-        // Requests are issued in browsing order, so PhotoKit can begin with the
-        // next items while still scheduling the remainder of the 15-item batch.
-        for asset in assets {
-            loadImage(for: asset) { _ in }
-
-            if asset.mediaSubtypes.contains(.photoLive) {
-                loadLivePhoto(for: asset) { _ in }
-            } else if asset.mediaType == .video {
-                loadVideoAsset(for: asset) { _ in }
+        // Issue the current group's previews first, then the next group's.
+        // Retained requests and display-ready results survive batch promotion.
+        for asset in assets { loadImage(for: asset) { _ in } }
+        for group in [current, next] {
+            // Limit eager full-media downloads to the first two in each group.
+            for asset in group.prefix(2) {
+                if asset.mediaSubtypes.contains(.photoLive) {
+                    loadLivePhoto(for: asset) { _ in }
+                } else if asset.mediaType == .video {
+                    loadVideoAsset(for: asset) { _ in }
+                }
             }
         }
     }
 
     func loadImage(for asset: PHAsset, completion: @escaping (UIImage?) -> Void) {
         let identifier = asset.localIdentifier
-        if let cachedImage = cachedImages[identifier] {
+        if let cachedImage = cachedImages.object(forKey: identifier as NSString) {
             completion(cachedImage)
-            return
+            if imageRequests[identifier] == nil { return }
         }
 
         imageCompletions[identifier, default: []].append(completion)
         guard imageRequests[identifier] == nil else { return }
-        let requestGeneration = batchGeneration
+        let token = UUID()
 
         let requestID = manager.requestImage(
             for: asset,
@@ -75,17 +99,16 @@ final class MediaPreloadService {
             options: imageOptions()
         ) { [weak self] image, info in
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-            guard !isDegraded else { return }
-
             Task { @MainActor in
                 self?.finishImageRequest(
                     identifier: identifier,
                     image: image,
-                    generation: requestGeneration
+                    token: token,
+                    isDegraded: isDegraded
                 )
             }
         }
-        imageRequests[identifier] = requestID
+        imageRequests[identifier] = Request(id: requestID, token: token)
     }
 
     func loadLivePhoto(
@@ -100,7 +123,7 @@ final class MediaPreloadService {
 
         livePhotoCompletions[identifier, default: []].append(completion)
         guard livePhotoRequests[identifier] == nil else { return }
-        let requestGeneration = batchGeneration
+        let token = UUID()
 
         let options = PHLivePhotoRequestOptions()
         options.deliveryMode = .highQualityFormat
@@ -119,11 +142,11 @@ final class MediaPreloadService {
                 self?.finishLivePhotoRequest(
                     identifier: identifier,
                     livePhoto: livePhoto,
-                    generation: requestGeneration
+                    token: token
                 )
             }
         }
-        livePhotoRequests[identifier] = requestID
+        livePhotoRequests[identifier] = Request(id: requestID, token: token)
     }
 
     func loadVideoAsset(
@@ -138,7 +161,7 @@ final class MediaPreloadService {
 
         videoCompletions[identifier, default: []].append(completion)
         guard videoRequests[identifier] == nil else { return }
-        let requestGeneration = batchGeneration
+        let token = UUID()
 
         let options = PHVideoRequestOptions()
         options.deliveryMode = .automatic
@@ -152,16 +175,16 @@ final class MediaPreloadService {
                 self?.finishVideoRequest(
                     identifier: identifier,
                     videoAsset: videoAsset,
-                    generation: requestGeneration
+                    token: token
                 )
             }
         }
-        videoRequests[identifier] = requestID
+        videoRequests[identifier] = Request(id: requestID, token: token)
     }
 
     private func imageOptions() -> PHImageRequestOptions {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
+        options.deliveryMode = .opportunistic
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         return options
@@ -170,13 +193,20 @@ final class MediaPreloadService {
     private func finishImageRequest(
         identifier: String,
         image: UIImage?,
-        generation: Int
+        token: UUID,
+        isDegraded: Bool
     ) {
-        guard generation == batchGeneration else { return }
-        imageRequests[identifier] = nil
-        if activeIdentifiers.contains(identifier), let image {
-            cachedImages[identifier] = image
+        guard imageRequests[identifier]?.token == token else { return }
+        if let image {
+            let cost = image.cgImage.map { $0.bytesPerRow * $0.height }
+                ?? Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+            cachedImages.setObject(image, forKey: identifier as NSString, cost: cost)
         }
+        if isDegraded {
+            if let image { imageCompletions[identifier]?.forEach { $0(image) } }
+            return
+        }
+        imageRequests[identifier] = nil
         let completions = imageCompletions.removeValue(forKey: identifier) ?? []
         completions.forEach { $0(image) }
     }
@@ -184,9 +214,9 @@ final class MediaPreloadService {
     private func finishLivePhotoRequest(
         identifier: String,
         livePhoto: PHLivePhoto?,
-        generation: Int
+        token: UUID
     ) {
-        guard generation == batchGeneration else { return }
+        guard livePhotoRequests[identifier]?.token == token else { return }
         livePhotoRequests[identifier] = nil
         if activeIdentifiers.contains(identifier), let livePhoto {
             cachedLivePhotos[identifier] = livePhoto
@@ -198,9 +228,9 @@ final class MediaPreloadService {
     private func finishVideoRequest(
         identifier: String,
         videoAsset: AVAsset?,
-        generation: Int
+        token: UUID
     ) {
-        guard generation == batchGeneration else { return }
+        guard videoRequests[identifier]?.token == token else { return }
         videoRequests[identifier] = nil
         if activeIdentifiers.contains(identifier), let videoAsset {
             cachedVideoAssets[identifier] = videoAsset
@@ -209,36 +239,28 @@ final class MediaPreloadService {
         completions.forEach { $0(videoAsset) }
     }
 
-    private func stopCurrentBatch() {
-        if !activeAssets.isEmpty {
-            manager.stopCachingImages(
-                for: activeAssets,
-                targetSize: Self.displayTargetSize,
-                contentMode: .aspectFit,
-                options: imageOptions()
-            )
+    private func discardRequestsOutsideWindow() {
+        for identifier in Array(imageRequests.keys) where !activeIdentifiers.contains(identifier) {
+            if let request = imageRequests.removeValue(forKey: identifier) {
+                manager.cancelImageRequest(request.id)
+            }
+            cachedImages.removeObject(forKey: identifier as NSString)
+            let completions = imageCompletions.removeValue(forKey: identifier) ?? []
+            completions.forEach { $0(nil) }
         }
-
-        for requestID in imageRequests.values {
-            manager.cancelImageRequest(requestID)
+        for identifier in Array(livePhotoRequests.keys) where !activeIdentifiers.contains(identifier) {
+            if let request = livePhotoRequests.removeValue(forKey: identifier) {
+                manager.cancelImageRequest(request.id)
+            }
+            let completions = livePhotoCompletions.removeValue(forKey: identifier) ?? []
+            completions.forEach { $0(nil) }
         }
-        for requestID in livePhotoRequests.values {
-            manager.cancelImageRequest(requestID)
+        for identifier in Array(videoRequests.keys) where !activeIdentifiers.contains(identifier) {
+            if let request = videoRequests.removeValue(forKey: identifier) {
+                manager.cancelImageRequest(request.id)
+            }
+            let completions = videoCompletions.removeValue(forKey: identifier) ?? []
+            completions.forEach { $0(nil) }
         }
-        for requestID in videoRequests.values {
-            manager.cancelImageRequest(requestID)
-        }
-
-        activeAssets = []
-        activeIdentifiers = []
-        cachedImages = [:]
-        cachedLivePhotos = [:]
-        cachedVideoAssets = [:]
-        imageRequests = [:]
-        livePhotoRequests = [:]
-        videoRequests = [:]
-        imageCompletions = [:]
-        livePhotoCompletions = [:]
-        videoCompletions = [:]
     }
 }
